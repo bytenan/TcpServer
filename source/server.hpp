@@ -1,19 +1,37 @@
 #include <iostream>
-#include <algorithm>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <functional>
 #include <cstdio>
 #include <cassert>
 #include <ctime>
 #include <cstring>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
-#define LOG(format, ...) do {                                                               \
+#define INF 0
+#define DBG 1
+#define ERR 2
+#define LOG_LEVEL INF
+
+#define LOG(level, format, ...) do {                                                        \
+    if (level < LOG_LEVEL) break;                                                           \
     time_t t = time(nullptr);                                                               \
     struct tm *lt = localtime(&t);                                                          \
-    char buf[128] = { 0 };                                                                  \
-    strftime(buf, sizeof(buf) - 1, "%Y-%m-%d %H:%M:%S", lt);                                \
-    fprintf(stdout, "[%s] %s:%d: " format "\n", buf, __FILE__, __LINE__, ##__VA_ARGS__);    \
+    char temp[64] = { 0 };                                                                  \
+    strftime(temp, sizeof(temp) - 1, "%Y-%m-%d %H:%M:%S", lt);                              \
+    fprintf(stdout, "[%s] %s:%d: " format "\n", temp, __FILE__, __LINE__, ##__VA_ARGS__);   \
 } while(0)
+
+#define INF_LOG(format, ...) LOG(INF, format, ##__VA_ARGS__)
+#define DBG_LOG(format, ...) LOG(DBG, format, ##__VA_ARGS__)
+#define ERR_LOG(format, ...) LOG(ERR, format, ##__VA_ARGS__)
 
 #define BUFFER_DEFAULT_SIZE 1024
 class Buffer {
@@ -115,4 +133,186 @@ private:
     std::vector<char> buffer_;   
     uint64_t reader_offset_; 
     uint64_t writer_offset_; 
+};
+
+#define BACKLOG_SIZE 64
+class Socket {
+public:
+    Socket() : sockfd_(-1) {}
+    Socket(int sockfd) : sockfd_(sockfd) {}
+    ~Socket() { Close(); }
+    int Fd() { return sockfd_; }
+    bool Create() {
+        sockfd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sockfd_ < 0) {
+            ERR_LOG("SOCKET CREATE FAILED!");
+            return false;
+        }
+        return true;
+    }
+    bool Bind(const std::string &ip, uint16_t port) {
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = inet_addr(ip.c_str());
+        socklen_t addrlen = sizeof addr;
+        if (bind(sockfd_, (struct sockaddr *)&addr, addrlen) < 0) {
+            ERR_LOG("SOCKET BIND FAILED!");
+            return false;
+        }
+        return true;
+    }
+    bool Listen(int backlog = BACKLOG_SIZE) {
+        if (listen(sockfd_, backlog) < 0) {
+            ERR_LOG("SOCKET LISTEN FAILED!");
+            return false;
+        }
+        return true;
+    }
+    int Accept() {
+        int fd = accept(sockfd_, nullptr, nullptr);
+        if (fd < 0) {
+            ERR_LOG("SOCKET ACCEPT FAILED!");
+            return -1;
+        }
+        return fd;
+    }
+    bool Connect(const std::string &ip, uint16_t port) {
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = inet_addr(ip.c_str());
+        socklen_t addrlen = sizeof addr;
+        if (connect(sockfd_, (struct sockaddr *)&addr, addrlen) < 0) {
+            ERR_LOG("SOCKET CONNECT FAILED!");
+            return false;
+        }
+        return true;
+    }
+    ssize_t Recv(void *buf, size_t len, int flags = 0) {
+        ssize_t n = recv(sockfd_, buf, len, flags);
+        if (n <= 0) {
+            if (EAGAIN == errno || EINTR == errno) {
+                return 0;
+            }
+            ERR_LOG("SOCKET RECV FAILED!");
+            return -1;
+        }
+        return n;
+    }
+    ssize_t RecvNonBlock(void *buf, size_t len) {
+        return Recv(buf, len, MSG_DONTWAIT);
+    }
+    ssize_t Send(const void *buf, size_t len, int flags = 0) {
+        ssize_t n = send(sockfd_, buf, len, flags);
+        if (n <= 0) {
+            if (EAGAIN == errno || EINTR == errno) {
+                return 0;
+            }
+            ERR_LOG("SOCKET SEND FAILED!");
+            return -1;
+        }
+        return n;
+    }
+    ssize_t SendNonBlock(void *buf, size_t len) {
+        return Send(buf, len, MSG_DONTWAIT);
+    }
+    void Close() {
+        if (-1 != sockfd_) {
+            close(sockfd_);
+            sockfd_ = -1;
+        }
+    }
+    bool SetNonBlock() {
+        int flag; 
+        if (flag = fcntl(sockfd_, F_GETFL, 0) < 0) {
+            ERR_LOG("SOCKET SETNONBLOCK FAILED!");
+            return false;
+        }
+        if (fcntl(sockfd_, F_SETFL, flag | O_NONBLOCK) < 0) {
+            ERR_LOG("SOCKET SETNONBLOCK FAILED!");
+            return false;
+        }
+        return true;
+    }
+    bool SetReuseAddr() {
+        int val = 1;
+        if (setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, (void *)&val, sizeof (val)) < 0) {
+            ERR_LOG("SOCKET SETREUSEADDR FAILED!");
+            return false;
+        }
+        return true;
+    }
+    bool CreateClient(uint16_t port, const std::string &ip) {
+        if (!Create()) return false;
+        if (!Connect(ip, port)) return false;
+        return true;
+    }
+    bool CreateServer(uint16_t port, const std::string &ip = "0.0.0.0", bool is_block = true) {
+        if (!Create()) return false;
+        if (!is_block) if (!SetNonBlock()) return false;
+        if (!Bind(ip, port)) return false;
+        if (!Listen()) return false;
+        if(!SetReuseAddr()) return false;
+        return true;
+    }
+private:
+    int sockfd_;
+};
+
+using EventCallBack = std::function<void()>;
+class Channel {
+public:
+    Channel(int fd) : fd_(fd), events_(0), revents_(0) {}
+    int Fd() { return fd_; }
+    uint32_t Events() { return events_; }
+    void SetREvents(uint32_t revents) { revents_ = revents; }
+    void SetReadCallBack(const EventCallBack &read_cb) { read_cb_ = read_cb; }
+    void SetWriteCallBack(const EventCallBack & write_cb) { write_cb_ = write_cb; }
+    void SetErrorCallBack(const EventCallBack & error_cb) { error_cb_ = error_cb; }
+    void SetCloseCallBack(const EventCallBack & close_cb) { close_cb_ = close_cb; }
+    void SetAnyCallBack(const EventCallBack & any_cb) { any_cb_ = any_cb; }
+    // 读事件是否被监控
+    bool IsMonitorRead() { return events_ & EPOLLIN; }
+    // 写事件是否被监控
+    bool IsMonitorWrite() { return events_ & EPOLLOUT; }
+    // 读事件启动监控
+    void EnableMonitorRead() { events_ |= EPOLLIN;     /*TODO:后边还需添加到EventLoop的事件监控中*/ }
+    // 写事件启动监控
+    void EnableMonitorWrite() { events_ |= EPOLLOUT;   /*TODO:后边还需添加到EventLoop的事件监控中*/ }
+    // 读事件关闭监控
+    void DisableMonitorRead() { events_ &= ~EPOLLIN;   /*TODO:后边还需修改到EventLoop的事件监控中*/ }
+    // 写事件关闭监控
+    void DisableMonitorWrite() { events_ &= ~EPOLLOUT; /*TODO:后边还需修改到EventLoop的事件监控中*/ }
+    // 关闭所有事件的监控
+    void DisableMonitorAll() { events_ = 0; }
+    // 移除监控
+    void RemoveMonitor() { /*TODO:后边需要调用EventLoop的接口来移除监控*/ }
+    // 事件处理
+    void EventHandler() {
+        if ((revents_ & EPOLLIN) || (revents_ & EPOLLRDHUP) || (revents_ & EPOLLPRI)) {
+            if (read_cb_) read_cb_();
+            if (any_cb_) any_cb_();
+        }
+        // 有可能会释放连接的事件，每次只处理一个
+        if (revents_ & EPOLLOUT) {
+            if (write_cb_) write_cb_();
+            if (any_cb_) any_cb_();
+        } else if (revents_ & EPOLLERR) {
+            if (any_cb_) any_cb_();
+            if (error_cb_) error_cb_();
+        } else if (revents_ & EPOLLHUP) {
+            if (any_cb_) any_cb_();
+            if (close_cb_) close_cb_();
+        }
+    }
+private:
+    int fd_;    // 被监控的文件描述符
+    uint32_t events_;   // 当前需要监控的事件
+    uint32_t revents_;  // 当前连续触发的事件
+    EventCallBack read_cb_;     //读事件触发的回调函数
+    EventCallBack write_cb_;    //写事件触发的回调函数
+    EventCallBack error_cb_;    //错误事件触发的回调函数
+    EventCallBack close_cb_;    //连接断开事件触发的回调函数
+    EventCallBack any_cb_;      //任意事件触发的回调函数
 };

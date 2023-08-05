@@ -1,10 +1,10 @@
 #include "server.hpp"
 
 void TestLog() {
-    LOG("hello world");
-    LOG("haha--%d", 10);
+    DBG_LOG("hello world");
+    DBG_LOG("haha--%d", 10);
     std::string str = "nihao";
-    LOG("%s", str.c_str());
+    DBG_LOG("%s", str.c_str());
 }
 
 void TestBuffer() {
@@ -33,7 +33,7 @@ void TestBuffer() {
 int main() {
 
     // TestLog();
-    TestBuffer();
+    // TestBuffer();
 
     return 0;
 }
