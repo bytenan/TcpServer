@@ -4,6 +4,9 @@
 #include <unordered_map>
 #include <algorithm>
 #include <functional>
+#include <mutex>
+#include <thread>
+#include <memory>
 #include <cstdio>
 #include <cassert>
 #include <ctime>
@@ -13,6 +16,8 @@
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -261,11 +266,11 @@ private:
     int sockfd_;
 };
 
-class Poller;
+class EventLoop;
 using EventCallBack = std::function<void()>;
 class Channel {
 public:
-    Channel(Poller *poller, int fd) : fd_(fd), events_(0), revents_(0), poller_(poller) {}
+    Channel(EventLoop *loop, int fd) : fd_(fd), events_(0), revents_(0), loop_(loop) {}
     int Fd() { return fd_; }
     uint32_t Events() { return events_; }
     void SetREvents(uint32_t revents) { revents_ = revents; }
@@ -314,7 +319,7 @@ private:
     int fd_;    // 被监控的文件描述符
     uint32_t events_;   // 当前需要监控的事件
     uint32_t revents_;  // 当前连续触发的事件
-    Poller *poller_;
+    EventLoop *loop_;
     EventCallBack read_cb_;     //读事件触发的回调函数
     EventCallBack write_cb_;    //写事件触发的回调函数
     EventCallBack error_cb_;    //错误事件触发的回调函数
@@ -391,5 +396,201 @@ private:
     std::unordered_map<int, Channel *> channels_;
 };
 
-void Channel::RemoveMonitor() { poller_->RemoveEvent(this); }
-void Channel::UpdateMonitor() { poller_->UpdateEvent(this); }
+using TaskFunc = std::function<void()>;
+using ReleaseFunc = std::function<void()>;
+class TimerTask {
+public:
+    TimerTask(uint64_t id, uint32_t timeout, const TaskFunc &task_cb, const ReleaseFunc &release_cb) 
+        : id_(id), timeout_(timeout), is_cancel_(false), task_cb_(task_cb), release_cb_(release_cb) {}
+    ~TimerTask() { 
+        if (!is_cancel_) task_cb_(); 
+        release_cb_(); 
+    }
+    void Cancel() { is_cancel_ = true; }
+    uint32_t timeout() { return timeout_; }
+private:
+    uint64_t id_;       // 定时器对象ID
+    uint32_t timeout_;  // 定时器对象的超时时间
+    bool is_cancel_;    // false表示任务不取消，true表示任务被取消
+    TaskFunc task_cb_;  // 定时器对象要执行的任务
+    ReleaseFunc release_cb_;  // 用于删除TimingWheel中的指向定时器对象的weakptr
+};
+
+using TimerWeakPtr = std::weak_ptr<TimerTask>;
+using TimerSharedPtr = std::shared_ptr<TimerTask>;
+class TimeWheel {
+public:
+    TimeWheel(EventLoop *loop)
+        : tick_(0)
+        , capacity_(60)
+        , wheel_(capacity_)
+        , loop_(loop)
+        , timerfd_(InitTimerFd())
+        , timerfd_channel_(new Channel(loop_, timerfd_)) {
+        timerfd_channel_->SetReadCallBack(std::bind(&TimeWheel::OnTime, this));
+        timerfd_channel_->EnableMonitorRead();
+    }
+    void TimerAdd(uint64_t id, uint32_t timeout, TaskFunc task_cb);
+    void TimerRefresh(uint64_t id);
+    void TimerCancel(uint64_t id);
+    bool HasTimer(uint64_t id) { return timers_.end() == timers_.find(id) ? false : true; } 
+private:
+    void TimerRemove(uint64_t id) {
+        auto it = timers_.find(id);
+        if (timers_.end() != it) timers_.erase(it);
+    }
+    static int InitTimerFd() {
+        int timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+        if (timerfd < 0) {
+            ERR_LOG("TIMERFD CREATE FAILED!");
+            abort();
+        }
+        struct itimerspec itime;
+        itime.it_value.tv_sec = 1;
+        itime.it_value.tv_nsec = 0;//第一次超时时间为1s后
+        itime.it_interval.tv_sec = 1; 
+        itime.it_interval.tv_nsec = 0; //第一次超时后，每次超时的间隔时
+        timerfd_settime(timerfd, 0, &itime, NULL);
+        return timerfd;
+    }
+    int ReadTimeFd() {
+        uint64_t times;
+        int ret = read(timerfd_, &times, sizeof(times));
+        if (ret < 0) {
+            ERR_LOG("READ TIMEFD FAILED!");
+            abort();
+        }
+        return times;
+    }
+    void Run() {
+        tick_  = (tick_ + 1) % capacity_;
+        wheel_[tick_].clear();
+    }
+    void OnTime() {
+        int times = ReadTimeFd();
+        for (int i = 0; i < times; ++i) Run();
+    }
+    void TimerAddInLoop(uint64_t id, uint32_t timeout, TaskFunc task_cb) {
+        TimerSharedPtr tsp(new TimerTask(id, timeout, task_cb, std::bind(&TimeWheel::TimerRemove, this, id)));
+        timers_[id] = TimerWeakPtr(tsp);
+        int pos = (tick_ + timeout) % capacity_;
+        wheel_[pos].push_back(tsp);
+    }
+    void TimerRefreshInLoop(uint64_t id) {
+        auto it = timers_.find(id);
+        if (timers_.end() == it) return;
+        TimerSharedPtr tsp(it->second.lock());
+        int pos = (tick_ + tsp->timeout()) % capacity_;
+        wheel_[pos].push_back(tsp);
+    }
+    void TimerCancelInLoop(uint64_t id) {
+        auto it = timers_.find(id);
+        if (timers_.end() == it) return;
+        TimerSharedPtr tsp(it->second.lock());
+        if (tsp) tsp->Cancel();
+    }
+private:
+    int tick_;      // 秒针，秒针指向哪里，就释放哪里的智能指针，就相当于执行哪里的任务
+    int capacity_;  // 时间轮的总容量，这里定为60，所以也就定义了一个轮子。相当于表盘里的秒针转一圈
+    std::vector<std::vector<TimerSharedPtr>> wheel_;    // 轮子，保存定时器对象的sharedptr，当ptr被释放并且其中的计时器减到0时，定时器对象里的任务就会被执行
+    std::unordered_map<uint64_t, TimerWeakPtr> timers_; // 保存所有的定时器对象的weakptr，当需要使用sharedptr时，直接从这里取出weakptr，进而取出sharedptr
+    EventLoop *loop_;
+    int timerfd_;
+    std::unique_ptr<Channel> timerfd_channel_;
+};
+
+using Functor = std::function<void()>;
+class EventLoop {
+public:
+    EventLoop() : thread_id_(std::this_thread::get_id())
+                , event_fd_(CreateEventFd())
+                , event_fd_channel_(new Channel(this, event_fd_))
+                , time_wheel_(this)  {
+        event_fd_channel_->SetReadCallBack(std::bind(&EventLoop::ReadEventFd, this));
+        event_fd_channel_->EnableMonitorRead();
+    }
+    // 进行事件监控，处理就绪事件，处理任务队列中的任务
+    void Run() {
+        while (true) {
+            std::vector<Channel *> active;
+            poller_.Poll(&active);
+            for (auto &channel : active) channel->EventHandler();
+            ExecTasks();
+        }
+    }
+    // 判断当前线程是否是EventLoop线程
+    bool IsInLoop() { return thread_id_ == std::this_thread::get_id(); }
+    // 对于将要执行的任务，若在EventLoop线程则直接执行，否则压入任务队列。
+    void RunInLoop(const Functor &cb) {
+        if (IsInLoop()) return cb();
+        PushTask(cb);
+    }
+    void UpdateEvent(Channel *channel) { return poller_.UpdateEvent(channel); }
+    void RemoveEvent(Channel *channel) { return poller_.RemoveEvent(channel); }
+    void TimerAdd(uint64_t id, uint32_t timeout, TaskFunc task_cb) { time_wheel_.TimerAdd(id, timeout, task_cb); }
+    void TimerRefresh(uint64_t id) { time_wheel_.TimerRefresh(id); }
+    void TimerCancel(uint64_t id) { time_wheel_.TimerCancel(id); }
+    bool HasTimer(uint64_t id) { return time_wheel_.HasTimer(id); }
+private:
+    static int CreateEventFd() {
+        int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (fd < 0) {
+            ERR_LOG("CREATE EVENTFD FAILED!");
+            abort();
+        }
+        return fd;
+    }
+    void ReadEventFd() {
+        uint64_t val;
+        int n = read(event_fd_, &val, sizeof(val));
+        if (n < 0) {
+            if (EINTR == errno || EAGAIN == errno) return;
+            ERR_LOG("READ EVENTFD FAILED!");
+            abort();
+        }
+    }
+    void WriteEventFd() {
+        uint64_t val = 1;
+        int n = write(event_fd_, &val, sizeof(val));
+        if (n < 0) {
+            if (EINTR == errno || EAGAIN == errno) return;
+            ERR_LOG("WRITE EVENTFD FAILED!");
+            abort();
+        }
+    }
+    void ExecTasks() {
+        std::vector<Functor> tasks;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            tasks.swap(tasks_);
+        }
+        for (auto &task : tasks) task();
+    }
+    void PushTask(const Functor &cb) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            tasks_.push_back(cb);
+        }
+        WriteEventFd();
+    }
+private:
+    std::thread::id thread_id_;
+    Poller poller_;
+    int event_fd_;
+    std::unique_ptr<Channel> event_fd_channel_;
+    std::mutex mutex_;
+    std::vector<Functor> tasks_;
+    TimeWheel time_wheel_;
+};
+
+void Channel::RemoveMonitor() { loop_->RemoveEvent(this); }
+void Channel::UpdateMonitor() { loop_->UpdateEvent(this); }
+void TimeWheel::TimerAdd(uint64_t id, uint32_t timeout, TaskFunc task_cb) {
+    loop_->RunInLoop(std::bind(&TimeWheel::TimerAddInLoop, this, id, timeout, task_cb));
+}
+void TimeWheel::TimerRefresh(uint64_t id) {
+    loop_->RunInLoop(std::bind(&TimeWheel::TimerRefreshInLoop, this, id));
+}
+void TimeWheel::TimerCancel(uint64_t id) {
+    loop_->RunInLoop(std::bind(&TimeWheel::TimerCancelInLoop, this, id));
+}
