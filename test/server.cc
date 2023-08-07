@@ -1,6 +1,7 @@
 #include "../source/server.hpp"
 
 void CloseHandler(Channel *channel) {
+    DBG_LOG("close");
     channel->RemoveMonitor();
     delete channel;
 }
@@ -20,45 +21,41 @@ void WriteHandler(Channel *channel) {
 void ErrorHandler(Channel *channel) {
     CloseHandler(channel);
 }
-void AnyHandler(Channel *channel) {
-    DBG_LOG("有一个事件");
+void AnyHandler(EventLoop *loop, Channel *channel, uint64_t timerid) {
+    loop->TimerRefresh(timerid);
 }
 
-void Acceptor(Poller *poller, Channel *lisetn_channel) {
+void Acceptor(EventLoop *loop, Channel *lisetn_channel) {
     int fd = accept(lisetn_channel->Fd(), nullptr, nullptr);
     if (fd < 0) {
         ERR_LOG("Acceptor failed!");
         return;
     }    
-    Channel *channel = new Channel(poller, fd);
+
+    uint64_t timerid = rand() % 100000;
+    Channel *channel = new Channel(loop, fd);
     channel->SetReadCallBack(std::bind(ReadHandler, channel));
     channel->SetWriteCallBack(std::bind(WriteHandler, channel));
     channel->SetCloseCallBack(std::bind(CloseHandler, channel));
     channel->SetErrorCallBack(std::bind(ErrorHandler, channel));
-    channel->SetAnyCallBack(std::bind(AnyHandler, channel));
+    channel->SetAnyCallBack(std::bind(AnyHandler, loop, channel, timerid));
+    loop->TimerAdd(timerid, 10, std::bind(CloseHandler, channel));
     channel->EnableMonitorRead();
 }
 
 int main() {
-
+    srand(time(nullptr));
     Socket srv;
     if (!srv.CreateServer(8888)) {
         ERR_LOG("CreateServer failed!");
         return -1;
     }
 
-    Poller poller;
-    Channel channel(&poller, srv.Fd());
-    channel.SetReadCallBack(std::bind(Acceptor, &poller, &channel));
+    EventLoop loop;
+    Channel channel(&loop, srv.Fd());
+    channel.SetReadCallBack(std::bind(Acceptor, &loop, &channel));
     channel.EnableMonitorRead();
-
-    while (true) {
-        std::vector<Channel *> active;
-        poller.Poll(&active);
-        for (auto &a : active) {
-            a->EventHandler();
-        }
-    }
+    loop.Run();
     srv.Close();
     return 0;
 }

@@ -2,8 +2,8 @@
 
 int main() {
     Socket cli;
-    while (true) {
-        cli.CreateClient(8888, "127.0.0.1");
+    cli.CreateClient(8888, "127.0.0.1");
+    for(int i = 0; i < 5; ++i) {
         std::string msg = "hello world";
         cli.Send(msg.c_str(), msg.size());
         char buf[1024] = { 0 };
@@ -11,5 +11,6 @@ int main() {
         DBG_LOG("%s", buf);
         sleep(1);
     }
+    while (true) sleep(1);
     return 0;
 }
