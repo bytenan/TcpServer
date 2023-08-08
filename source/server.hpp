@@ -211,7 +211,7 @@ public:
     }
     ssize_t Send(const void *buf, size_t len, int flags = 0) {
         ssize_t n = send(sockfd_, buf, len, flags);
-        if (n <= 0) {
+        if (n < 0) {
             if (EAGAIN == errno || EINTR == errno) {
                 return 0;
             }
@@ -278,7 +278,7 @@ public:
     void SetWriteCallBack(const EventCallBack & write_cb) { write_cb_ = write_cb; }
     void SetErrorCallBack(const EventCallBack & error_cb) { error_cb_ = error_cb; }
     void SetCloseCallBack(const EventCallBack & close_cb) { close_cb_ = close_cb; }
-    void SetAnyCallBack(const EventCallBack & any_cb) { any_cb_ = any_cb; }
+    void SetAnyEventCallBack(const EventCallBack & any_event_cb) { any_event_cb_ = any_event_cb; }
     // 读事件是否被监控
     bool IsMonitorRead() { return events_ & EPOLLIN; }
     // 写事件是否被监控
@@ -300,18 +300,18 @@ public:
     // 事件处理
     void EventHandler() {
         if ((revents_ & EPOLLIN) || (revents_ & EPOLLRDHUP) || (revents_ & EPOLLPRI)) {
-            if (any_cb_) any_cb_();
+            if (any_event_cb_) any_event_cb_();
             if (read_cb_) read_cb_();
         }
         // 有可能会释放连接的事件，每次只处理一个
         if (revents_ & EPOLLOUT) {
             if (write_cb_) write_cb_();
-            if (any_cb_) any_cb_();
+            if (any_event_cb_) any_event_cb_();
         } else if (revents_ & EPOLLERR) {
-            if (any_cb_) any_cb_();
+            if (any_event_cb_) any_event_cb_();
             if (error_cb_) error_cb_();
         } else if (revents_ & EPOLLHUP) {
-            if (any_cb_) any_cb_();
+            if (any_event_cb_) any_event_cb_();
             if (close_cb_) close_cb_();
         }
     }
@@ -324,7 +324,7 @@ private:
     EventCallBack write_cb_;    //写事件触发的回调函数
     EventCallBack error_cb_;    //错误事件触发的回调函数
     EventCallBack close_cb_;    //连接断开事件触发的回调函数
-    EventCallBack any_cb_;      //任意事件触发的回调函数
+    EventCallBack any_event_cb_;//任意事件触发的回调函数
 };
 
 #define MAX_EPOLLEVENTS 1024
@@ -520,6 +520,8 @@ public:
     }
     // 判断当前线程是否是EventLoop线程
     bool IsInLoop() { return thread_id_ == std::this_thread::get_id(); }
+    // 当前线程必须在EventLoop线程
+    void AssertInLoop() { assert(thread_id_ == std::this_thread::get_id()); }
     // 对于将要执行的任务，若在EventLoop线程则直接执行，否则压入任务队列。
     void RunInLoop(const Functor &cb) {
         if (IsInLoop()) return cb();
@@ -581,6 +583,193 @@ private:
     std::mutex mutex_;
     std::vector<Functor> tasks_;
     TimeWheel time_wheel_;
+};
+
+class Any {
+private:
+    class Holder {
+    public:
+        virtual ~Holder() {}
+        virtual const std::type_info &type() = 0;
+        virtual Holder *clone() = 0;
+    };
+    template<class T>
+    class PlaceHolder : public Holder {
+    public:
+        PlaceHolder(const T &val) : val_(val) {}
+        virtual const std::type_info &type() { return typeid(T); }
+        virtual Holder *clone() { return new PlaceHolder(val_); }
+    public:
+        T val_;
+    };
+    Holder *content_;
+public:
+    Any() : content_(nullptr) {}
+    template<class T>
+    Any(const T &val) : content_(new PlaceHolder<T>(val)) {}
+    Any(const Any &other) : content_(nullptr == other.content_ ? nullptr : other.content_->clone()) {}
+    ~Any() { delete content_; }
+    Any &swap(Any &other) {
+        std::swap(content_, other.content_);
+        return *this;
+    }
+    template<class T>
+    Any &operator=(const T &val) { return Any(val).swap(*this); }
+    Any &operator=(const Any &other) { return Any(other).swap(*this); }
+    template<class T>
+    T *get() {
+        assert(typeid(T) == content_->type());
+        return &(dynamic_cast<PlaceHolder<T> *>(content_)->val_);
+    }
+};
+
+class Connection;
+typedef enum { DISCONNECTED, CONNECTING, CONNECTED, DISCONNECTING } ConnStatu;
+using ConnectionPtr = std::shared_ptr<Connection>;
+using ConnectedCallBack = std::function<void(const ConnectionPtr &)>;
+using MessageCallBack = std::function<void(const ConnectionPtr &, Buffer *)>;
+using ClosedCallBack = std::function<void(const ConnectionPtr &)>;
+using AnyEventCallBack = std::function<void(const ConnectionPtr &)>;
+class Connection : public std::enable_shared_from_this<Connection> {
+public:
+    Connection(EventLoop *loop, uint64_t conn_id, int sockfd)
+        : conn_id_(conn_id)
+        , is_enable_inactive_release_(false)
+        , sockfd_(sockfd)
+        , loop_(loop)
+        , statu_(CONNECTING)
+        , socket_(sockfd_) 
+        , channel_(loop, sockfd_) {
+        channel_.SetReadCallBack(std::bind(&Connection::ReadHandler, this));
+        channel_.SetWriteCallBack(std::bind(&Connection::WriteHandler, this));
+        channel_.SetErrorCallBack(std::bind(&Connection::ErrorHandler, this));
+        channel_.SetCloseCallBack(std::bind(&Connection::CloseHandler, this));
+        channel_.SetAnyEventCallBack(std::bind(&Connection::AnyEventHandler, this));
+    }
+    ~Connection() { DBG_LOG("RELEASE CONNECTION:%p", this); }
+    uint64_t Id() { return conn_id_; }
+    uint64_t Fd() { return sockfd_; }
+    bool IsConnected() { return CONNECTED == statu_; }
+    Any *Context() { return &context_; }
+    void SetContext(const Any &context) { context_ = context; }
+    void SetConnectedCallBack(const ConnectedCallBack &connected_cb) { connected_cb_ = connected_cb; }
+    void SetMessageCallBack(const MessageCallBack &message_cb) { message_cb_ = message_cb; }
+    void SetClosedCallBack(const ClosedCallBack &closed_cb) { closed_cb_ = closed_cb; }
+    void SetAnyEventCallBack(const AnyEventCallBack &any_event_cb) { any_event_cb_ = any_event_cb; }
+    void SetServerClosedCallBack(const ClosedCallBack &server_closed_cb) { server_closed_cb_ = server_closed_cb; }
+    // 连接建立就绪后，进行channel回调设置，启动读监控
+    void Established() { loop_->RunInLoop(std::bind(&Connection::EstablishedInLoop, this)); }
+    // 将数据写入输出缓冲区，启动写监控
+    void Send(const char *data, size_t len) {
+        Buffer buf;
+        buf.WriteAndPushOffset(data, len);
+        loop_->RunInLoop(std::bind(&Connection::SendInLoop, this, buf));
+    }
+    // 给组件使用者提供的接口，用于关闭连接（但实际不关闭，该接口只检验缓冲区内是否还有数据待处理）
+    void ShutDown() { loop_->RunInLoop(std::bind(&Connection::ShutDownInLoop, this)); }
+    // 启动sec时间内的非活跃连接销毁
+    void EnableInactiveRelease(int sec) { loop_->RunInLoop(std::bind(&Connection::EnableInactiveReleaseInLoop, this, sec)); }
+    // 关闭非活跃连接销毁
+    void DisableInactiveRelease() { loop_->RunInLoop(std::bind(&Connection::DisableInactiveReleaseInLoop, this)); }
+    // 升级协议---非线程安全，这个接口必须在EventLoop线程立即执行，防备新的事件触发后，协议还未升级。
+    void Upgrade(const Any &context, const ConnectedCallBack &connected_cb, const MessageCallBack &message_cb, 
+                const ClosedCallBack &closed_cb, const AnyEventCallBack &any_event_cb) {
+        loop_->AssertInLoop();
+        loop_->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, connected_cb, message_cb, closed_cb, any_event_cb));
+    }
+private:
+    void ReadHandler() {
+        char buf[65536] = { 0 };
+        ssize_t n = socket_.RecvNonBlock(buf, 65535);
+        if (n < 0) return ShutDownInLoop();
+        in_buffer_.WriteAndPushOffset(buf, n);
+        if (in_buffer_.ReadableSize() > 0) message_cb_(shared_from_this(), &in_buffer_);
+    }
+    void WriteHandler() {
+        ssize_t n = socket_.SendNonBlock(out_buffer_.ReaderPosition(), out_buffer_.ReadableSize());
+        if (n < 0) {
+            if (in_buffer_.ReadableSize() > 0) message_cb_(shared_from_this(), &in_buffer_);
+            ReleaseInLoop();
+        }
+        out_buffer_.MoveReaderOffset(n);
+        if (out_buffer_.ReadableSize() == 0) {
+            channel_.DisableMonitorRead();
+            if (DISCONNECTING == statu_) ReleaseInLoop();
+        }
+    }
+    void CloseHandler() {
+        if (in_buffer_.ReadableSize() > 0) message_cb_(shared_from_this(), &in_buffer_);
+        ReleaseInLoop();
+    }
+    void ErrorHandler() { CloseHandler(); }
+    void AnyEventHandler() {
+        if (is_enable_inactive_release_) loop_->TimerRefresh(conn_id_); 
+        if (any_event_cb_) any_event_cb_(shared_from_this()); 
+    }
+    void EstablishedInLoop() {
+        assert(CONNECTING == statu_);
+        statu_ = CONNECTED;
+        channel_.EnableMonitorRead();
+        if (connected_cb_) connected_cb_(shared_from_this());
+    }
+    void SendInLoop(Buffer buf) {
+        if (DISCONNECTED == statu_) return;
+        out_buffer_.WriteBufferAndPushOffset(buf);
+        if (!channel_.IsMonitorWrite()) channel_.EnableMonitorWrite();
+    }
+    void ShutDownInLoop() {
+        statu_ = DISCONNECTING;
+        if (in_buffer_.ReadableSize() > 0) 
+            if (message_cb_) message_cb_(shared_from_this(), &in_buffer_);
+        if (out_buffer_.ReadableSize() > 0) 
+            if (!channel_.IsMonitorWrite()) channel_.EnableMonitorWrite();
+        if (out_buffer_.ReadableSize() == 0) 
+            ReleaseInLoop();
+    }
+    // 真正关闭连接的接口
+    void ReleaseInLoop() {
+        statu_ = DISCONNECTED;
+        channel_.RemoveMonitor();
+        socket_.Close();
+        if (loop_->HasTimer(conn_id_)) DisableInactiveReleaseInLoop();
+        if (closed_cb_) closed_cb_(shared_from_this());
+        if (server_closed_cb_) server_closed_cb_(shared_from_this());
+    }
+    void EnableInactiveReleaseInLoop(int sec) {
+        is_enable_inactive_release_ = true;
+        if (loop_->HasTimer(conn_id_)) 
+            loop_->TimerRefresh(conn_id_);
+        else 
+            loop_->TimerAdd(conn_id_, sec, std::bind(&Connection::ReleaseInLoop, this));
+    }
+    void DisableInactiveReleaseInLoop() {
+        is_enable_inactive_release_ = false;
+        if (loop_->HasTimer(conn_id_)) loop_->TimerCancel(conn_id_);
+    }
+    void UpgradeInLoop(const Any &context, const ConnectedCallBack &connected_cb, const MessageCallBack &message_cb, 
+                const ClosedCallBack &closed_cb, const AnyEventCallBack &any_event_cb) {
+        context_ = context;
+        connected_cb_ = connected_cb;
+        message_cb_ = message_cb;
+        closed_cb_ = closed_cb;
+        any_event_cb_ = any_event_cb;
+    }
+private:
+    uint64_t conn_id_;  // 连接的ID
+    bool is_enable_inactive_release_;   // 连接是否开启“非活跃销毁”
+    int sockfd_;        // 连接关联的文件描述符
+    EventLoop *loop_;   // 连接关联的EventLoop
+    ConnStatu statu_;   // 连接所处的状态
+    Channel channel_;   // 连接的事件管理
+    Socket socket_;     // 套接字操作管理
+    Buffer in_buffer_;  // 输入缓冲区
+    Buffer out_buffer_; // 输出缓冲区
+    Any context_;       // 上下文
+    ConnectedCallBack connected_cb_;    
+    MessageCallBack message_cb_;        
+    ClosedCallBack closed_cb_;
+    AnyEventCallBack any_event_cb_;
+    ClosedCallBack server_closed_cb_;
 };
 
 void Channel::RemoveMonitor() { loop_->RemoveEvent(this); }
