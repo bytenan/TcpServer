@@ -1,28 +1,19 @@
 #include "../source/server.hpp"
 
-void CloseHandler(Channel *channel) {
-    DBG_LOG("close");
-    channel->RemoveMonitor();
-    delete channel;
+uint64_t conn_id = 0;
+std::unordered_map<uint64_t, ConnectionPtr> conns;
+
+void OnMessage(const ConnectionPtr &conn, Buffer *buf) {
+    DBG_LOG("%s", buf->ReaderPosition());
+    buf->MoveReaderOffset(buf->ReadableSize());
+    std::string str = "hadhadwadadawda";
+    conn->Send(str.c_str(), str.size());
 }
-void ReadHandler(Channel *channel) {
-    char buf[1024] = { 0 };
-    ssize_t n = recv(channel->Fd(), buf, sizeof(buf) - 1, 0);
-    if (n < 0) CloseHandler(channel);
-    DBG_LOG("%s", buf);
-    channel->EnableMonitorWrite();
+void OnClosed(const ConnectionPtr &conn) {
+    conns.erase(conn->Id());
 }
-void WriteHandler(Channel *channel) {
-    std::string msg = "哇哈哈";
-    ssize_t n = send(channel->Fd(), msg.c_str(), msg.size(), 0);
-    if (n < 0) CloseHandler(channel);
-    channel->DisableMonitorWrite();
-}
-void ErrorHandler(Channel *channel) {
-    CloseHandler(channel);
-}
-void AnyHandler(EventLoop *loop, Channel *channel, uint64_t timerid) {
-    loop->TimerRefresh(timerid);
+void OnConnected(const ConnectionPtr &conn) {
+    DBG_LOG("NEW CONNECTION:%p", conn.get());
 }
 
 void Acceptor(EventLoop *loop, Channel *lisetn_channel) {
@@ -31,20 +22,17 @@ void Acceptor(EventLoop *loop, Channel *lisetn_channel) {
         ERR_LOG("Acceptor failed!");
         return;
     }    
-
-    uint64_t timerid = rand() % 100000;
-    Channel *channel = new Channel(loop, fd);
-    channel->SetReadCallBack(std::bind(ReadHandler, channel));
-    channel->SetWriteCallBack(std::bind(WriteHandler, channel));
-    channel->SetCloseCallBack(std::bind(CloseHandler, channel));
-    channel->SetErrorCallBack(std::bind(ErrorHandler, channel));
-    channel->SetAnyCallBack(std::bind(AnyHandler, loop, channel, timerid));
-    loop->TimerAdd(timerid, 10, std::bind(CloseHandler, channel));
-    channel->EnableMonitorRead();
+    ++conn_id;
+    ConnectionPtr conn(new Connection(loop, conn_id, fd));
+    conn->SetMessageCallBack(std::bind(OnMessage, std::placeholders::_1, std::placeholders::_2));
+    conn->SetServerClosedCallBack(std::bind(OnClosed, std::placeholders::_1));
+    conn->SetConnectedCallBack(std::bind(OnConnected, std::placeholders::_1));
+    conn->EnableInactiveRelease(10);
+    conn->Established();
+    conns.insert(std::make_pair(conn_id, conn));
 }
 
 int main() {
-    srand(time(nullptr));
     Socket srv;
     if (!srv.CreateServer(8888)) {
         ERR_LOG("CreateServer failed!");
