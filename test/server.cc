@@ -8,6 +8,7 @@ void OnMessage(const ConnectionPtr &conn, Buffer *buf) {
     buf->MoveReaderOffset(buf->ReadableSize());
     std::string str = "hadhadwadadawda";
     conn->Send(str.c_str(), str.size());
+    conn->Shutdown();
 }
 void OnClosed(const ConnectionPtr &conn) {
     conns.erase(conn->Id());
@@ -33,13 +34,12 @@ void Acceptor(EventLoop *loop, Channel *lisetn_channel) {
 }
 
 int main() {
+    EventLoop loop;
     Socket srv;
     if (!srv.CreateServer(8888)) {
         ERR_LOG("CreateServer failed!");
         return -1;
-    }
-
-    EventLoop loop;
+    } 
     Channel channel(&loop, srv.Fd());
     channel.SetReadCallBack(std::bind(Acceptor, &loop, &channel));
     channel.EnableMonitorRead();
